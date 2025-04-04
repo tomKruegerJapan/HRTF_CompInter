@@ -1254,7 +1254,7 @@ def main():
         spline_method=SPLINE_KIND,
         fft_len=FFT_LEN,
         n_bands=NUM_BANDS,
-        max_meas=2,
+        max_meas=None,
         seg_thresh=SEGMENT_THRESHOLD,
         err_bound=ERROR_BOUND
     )
@@ -1264,6 +1264,19 @@ def main():
     right_results = compressed_db['right_results']
     positions = compressed_db.get('positions', None)  # Retrieve measurement positions from the SOFA file
     num_meas = len(left_results)
+    
+    total_cp = 0
+    count = 0
+    for res in left_results + right_results:
+        if res is not None and 'num_control_points' in res:
+            total_cp += res['num_control_points']
+            count += 1
+    if count > 0:
+        avg_cp = total_cp / count
+        print(f"Average number of control points (both ears): {avg_cp:.2f}")
+    else:
+        print("No valid measurements found.")
+
     
     # Compute combined compression ratio for each measurement
     freq_length = len(left_results[0]['frequencies'])
