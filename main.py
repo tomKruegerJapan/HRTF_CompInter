@@ -550,7 +550,7 @@ def post_process_control_points(cp, freqs, smooth, method='pchip', error_tol=1.0
         # If no removal was successful, try merging adjacent points
         if not changed:
             for i in range(1, len(cp) - 1):
-                merged_freq = (cp[i, 0] + cp[i+1, 0]) / 2
+                merged_freq = np.sqrt(cp[i, 0] * cp[i+1, 0])
                 merged_mag = (cp[i, 1] + cp[i+1, 1]) / 2
                 candidate = np.delete(cp, i+1, axis=0)
                 candidate[i, :] = [merged_freq, merged_mag]
@@ -718,7 +718,7 @@ def post_process_control_points(cp, freqs, smooth, method='pchip', error_tol=1.0
                 break
         if not changed:
             for i in range(1, len(cp) - 1):
-                merged_freq = (cp[i, 0] + cp[i+1, 0]) / 2
+                merged_freq = np.sqrt(cp[i, 0] * cp[i+1, 0])
                 merged_mag = (cp[i, 1] + cp[i+1, 1]) / 2
                 candidate = np.delete(cp, i+1, axis=0)
                 candidate[i, :] = [merged_freq, merged_mag]
