@@ -1175,32 +1175,51 @@ def plot_filtering_stats(result, title_suffix="", az=None, el=None):
 
 def plot_average_filtering_error(measurements):
     """
-    Plot the average filtering error across all measurements.
-
+    Plot the average filtering error across all measurements with a 95% confidence interval.
+    
     Parameters:
         measurements (list): List of measurement dictionaries.
     
     How it works:
-        - Computes the average error (smoothed minus raw) across all measurements.
-        - Plots the error on a semilogarithmic frequency axis.
+        - Computes the error (smoothed minus raw) for each measurement.
+        - Computes the mean error and the standard error across measurements at each frequency.
+        - Calculates the 95% confidence interval (using a multiplier of 1.96).
+        - Plots the average error and shades the area between the lower and upper CI bounds.
     """
     if len(measurements) == 0:
         print("No measurements provided for average filtering error plot.")
         return
+
+    # Assume that all measurements share the same frequency grid
     freq = measurements[0]['frequencies']
-    avg_error = np.zeros_like(freq)
-    for res in measurements:
-        avg_error += (res['smoothed_mag'] - res['raw_mag'])
-    avg_error /= len(measurements)
+    
+    # Stack the error arrays from each measurement
+    errors = np.array([res['smoothed_mag'] - res['raw_mag'] for res in measurements])
+    
+    # Calculate the mean error and standard error at each frequency
+    avg_error = np.mean(errors, axis=0)
+    std_error = np.std(errors, axis=0)
+    n = len(measurements)
+    se = std_error / np.sqrt(n)
+    
+    # Define the multiplier for a 95% confidence interval (approximately 1.96 for large n)
+    ci_multiplier = 1.96
+    lower_bound = avg_error - ci_multiplier * se
+    upper_bound = avg_error + ci_multiplier * se
+
+    # Create the plot
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.semilogx(freq, avg_error, 'm-', label="Average Filtering Error")
-    ax.set_xlabel("Frequency (Hz)", fontsize=35)
-    ax.set_ylabel("Error (dB)", fontsize=35)
-    ax.set_title("Average Filtering Error Across All Measurements", fontsize=40)
-    ax.set_ylim(-0.2, 0.2)
+    ax.fill_between(freq, lower_bound, upper_bound, color='m', alpha=0.3, label="95% CI")
+    ax.set_xlabel("Frequency (Hz)", fontsize=30)
+    ax.set_ylabel("Error (dB)", fontsize=30)
+    ax.set_title("Average Filtering Error Across All Measurements", fontsize=35)    
+    ax.set_ylim(-0.10, 0.05)
+    ax.tick_params(axis='both', which='major', labelsize=30)
     ax.legend()
     ax.grid(True, which="both", linestyle="--", alpha=0.7)
     plt.show()
+
 
 
 # -----------------------------
