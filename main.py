@@ -1,26 +1,3 @@
-"""
-Adaptive HRTF Compression Module
-
-This module implements an adaptive compression scheme for Head-Related Transfer Functions (HRTFs).
-It processes impulse responses from SOFA files by computing frequency responses, applying adaptive
-Wiener filtering, and selecting a set of control points that allow reconstructing the frequency
-response within an acceptable error threshold. The module uses various signal processing, 
-optimization, and interpolation methods (including cubic and PCHIP splines), and leverages parallel
-computing via Numba for efficient error metric computation.
-
-Main components:
-    - Frequency response computation and filtering.
-    - Reconstruction using control points with error metrics.
-    - ERB (Equivalent Rectangular Bandwidth) based segmentation and error analysis.
-    - Control point detection, refinement, and merging strategies.
-    - Adaptive compression applied to HRTFs loaded from SOFA files.
-    - CSV file output for control points and compression rates.
-    - Plotting and interactive visualization using Matplotlib.
-
-Usage:
-    Run the module as a script to open a SOFA file, compress the HRTFs, and display interactive plots.
-"""
-
 import os
 import sys
 import numpy as np
@@ -31,9 +8,59 @@ from scipy.interpolate import CubicSpline, PchipInterpolator, InterpolatedUnivar
 from scipy.optimize import dual_annealing, minimize_scalar
 import sofa
 import csv
-from numba import njit, prange
+# from numba import njit, prange
 from matplotlib import rc_context
+import pickle
+import glob
+from joblib import Parallel, delayed
+from tqdm import tqdm
 
+# ——————————————————————————————————————————————————————
+# New: Auditory-smoothing implementations
+# ——————————————————————————————————————————————————————
+
+def erb_smooth(mag, freqs, n_bands=42):
+    """
+    ERB-band smoothing via Gammatone-like filterbank.
+    """
+    # compute ERB edges
+    erb_min = 24.7 * (4.37 * freqs[0] / 1000 + 1)
+    erb_max = 24.7 * (4.37 * freqs[-1] / 1000 + 1)
+    erb_edges = np.linspace(erb_min, erb_max, n_bands+1)
+    # back to Hz
+    hz_edges = ( (erb_edges/24.7 - 1) * 1000 / 4.37 )
+    smooth = np.zeros_like(mag)
+    for i in range(n_bands):
+        lo, hi = hz_edges[i], hz_edges[i+1]
+        mask = (freqs >= lo) & (freqs < hi)
+        if np.any(mask):
+            # energy sum then back to dB
+            e = np.mean(10**(mag[mask]/10))
+            smooth[mask] = 10*np.log10(e + 1e-12)
+    return smooth
+
+def octave_smooth(mag, freqs, frac_oct=3):
+    """
+    Fractional-octave smoothing: window spans [f/2^(1/frac_oct), f*2^(1/frac_oct)].
+    """
+    log_mag = mag.copy()
+    smooth = np.zeros_like(log_mag)
+    for i,f in enumerate(freqs):
+        k = 2**(1/frac_oct)
+        lo, hi = f/k, f*k
+        mask = (freqs >= lo) & (freqs <= hi)
+        smooth[i] = np.mean(log_mag[mask]) if np.any(mask) else log_mag[i]
+    return smooth
+
+def cepstral_smooth(mag, lifter_len=20):
+    """
+    Cepstral liftering: keep lowest lifter_len quefrency bins.
+    """
+    # work in log-mag
+    cep = np.fft.ifft(mag).real
+    liftered = np.concatenate([cep[:lifter_len], np.zeros_like(cep[lifter_len:])])
+    smooth = np.real(np.fft.fft(liftered))
+    return smooth
 
 # -----------------------------
 # Frequency Response & Filtering
@@ -106,61 +133,100 @@ def adaptive_wiener(mag, base_win=11, err_thresh=1.0, alt_win=7, noise=1e-1):
     return filtered
 
 
-def apply_filter(mag, win_size=11, err_thresh=1.0, alt_win=7, noise=1e-1):
+
+
+# -----------------------------
+# Reconstruction & Error Metrics
+# -----------------------------
+def apply_filter(mag,
+                 freqs=None,
+                 method='wiener',
+                 win_size=11,
+                 err_thresh=1.0,
+                 alt_win=7,
+                 noise=1e-1,
+                 n_bands=42,
+                 frac_oct=3,
+                 lifter_len=20):
     """
-    Wrapper for applying the adaptive Wiener filter.
-
-    Parameters:
-        mag (np.ndarray): Input magnitude spectrum (in dB).
-        win_size (int): Base window size for Wiener filtering.
-        err_thresh (float): Threshold for local error.
-        alt_win (int): Alternative window size for re-filtering.
-        noise (float): Noise power estimate.
-
-    Returns:
-        np.ndarray: The filtered (smoothed) magnitude spectrum.
-    
+    Dispatch to one of four smoothing methods:
+      - 'wiener'   : adaptive Wiener filtering
+      - 'erb'      : ERB-band (gammatone-like) smoothing
+      - 'octave'   : fractional-octave (1/frac_oct) smoothing
+      - 'cepstral' : cepstral liftering
     """
-    return adaptive_wiener(mag, base_win=win_size, err_thresh=err_thresh, alt_win=alt_win, noise=noise)
+    if method == 'wiener':
+        return adaptive_wiener(
+            mag,
+            base_win=win_size,
+            err_thresh=err_thresh,
+            alt_win=alt_win,
+            noise=noise
+        )
 
+    elif method == 'erb':
+        if freqs is None:
+            raise ValueError("ERB smoothing requires `freqs` array")
+        return erb_smooth(
+            mag,
+            freqs,
+            n_bands=n_bands
+        )
+
+    elif method == 'octave':
+        if freqs is None:
+            raise ValueError("Octave smoothing requires `freqs` array")
+        return octave_smooth(
+            mag,
+            freqs,
+            frac_oct=frac_oct
+        )
+
+    elif method == 'cepstral':
+        return cepstral_smooth(
+            mag,
+            lifter_len=lifter_len
+        )
+
+    else:
+        raise ValueError(f"Unknown smoothing method: {method}")
 
 # -----------------------------
 # Reconstruction & Error Metrics
 # -----------------------------
 def reconstruct_hrtf(control_pts, method='pchip', grid=None):
     """
-    Reconstruct the HRTF magnitude response using interpolation on control points.
+    Reconstruct the HRTF magnitude response using control points.
 
     Parameters:
-        control_pts (np.ndarray): Array of control points, each a [frequency, magnitude] pair.
-        method (str): Interpolation method to use ('cubic' for CubicSpline, otherwise PchipInterpolator).
-        grid (np.ndarray, optional): Frequency grid for interpolation. If None, a default grid of 513 points is used.
+        control_pts (np.ndarray): Nx2 array [frequency, magnitude].
+        method       (str)       : 'cubic' for CubicSpline, else PCHIP.
+        grid         (np.ndarray): Frequencies to interpolate on (default 513 samples).
 
     Returns:
-        grid (np.ndarray): Frequency grid used for reconstruction.
-        recon (np.ndarray): Reconstructed magnitude response on the grid.
-
-    How it works:
-        - Sorts control points by frequency.
-        - Chooses an interpolation function (cubic spline or PCHIP) based on the method.
-        - Interpolates the magnitude over the given or default grid.
+        grid (np.ndarray), recon (np.ndarray)
     """
-    # Ensure control points are sorted by frequency
-    cp_sorted = control_pts[np.argsort(control_pts[:, 0])]
-    cp_freqs = cp_sorted[:, 0]
-    cp_mags = cp_sorted[:, 1]
-    # Select interpolation method
+    # sort control points by frequency
+    cp = control_pts[np.argsort(control_pts[:,0])]
+    freqs_cp = cp[:,0]
+    mags_cp  = cp[:,1]
+    # print(f"Reconstructing HRTF with {len(cp)} control points")
+    # choose interpolator
     if method == 'cubic':
-        spline = CubicSpline(cp_freqs, cp_mags, extrapolate=True)
+        interp_fn = CubicSpline(freqs_cp, mags_cp, extrapolate=True)
     else:
-        spline = PchipInterpolator(cp_freqs, cp_mags, extrapolate=True)
-    # Use default grid if none provided
+        interp_fn = PchipInterpolator(freqs_cp, mags_cp, extrapolate=True)
+
+    # build output grid
     if grid is None:
-        grid = np.linspace(cp_freqs[0], cp_freqs[-1], 513)
-    return grid, spline(grid)
+        grid = np.linspace(freqs_cp[0], freqs_cp[-1], 513)
+
+    # interpolate
+    recon = interp_fn(grid)
+    return grid, recon
 
 
-@njit(parallel=True, cache=True)
+# @njit(parallel=True, cache=True)
 def parallel_spectral_distortion(orig, recon):
     """
     Compute the spectral distortion between the original and reconstructed signals.
@@ -176,13 +242,13 @@ def parallel_spectral_distortion(orig, recon):
     """
     n = orig.shape[0]
     total = 0.0
-    for i in prange(n):
+    for i in range(n):
         diff = orig[i] - recon[i]
         total += diff * diff
     return np.sqrt(total / n)
 
 
-@njit(parallel=True, cache=True)
+# @njit(parallel=True, cache=True)
 def parallel_calc_segment_error(freqs, orig, recon, low, high):
     """
     Calculate the maximum absolute error in a segment of the frequency response.
@@ -201,7 +267,7 @@ def parallel_calc_segment_error(freqs, orig, recon, low, high):
     """
     n = freqs.shape[0]
     error_val = 0.0
-    for i in prange(n):
+    for i in range(n):
         if freqs[i] >= low and freqs[i] <= high:
             diff = abs(orig[i] - recon[i])
             if diff > error_val:
@@ -214,7 +280,7 @@ spectral_distortion = parallel_spectral_distortion
 calc_segment_error = parallel_calc_segment_error
 
 
-def enforce_endpoints(cp, freqs, smooth):
+def enforce_endpoints(cp, freqs, raw):
     """
     Enforce that the first and last control points match the endpoints of the smoothed spectrum.
 
@@ -227,8 +293,8 @@ def enforce_endpoints(cp, freqs, smooth):
         np.ndarray: Control points with the endpoints adjusted.
     """
     cp = cp[np.argsort(cp[:, 0])]
-    cp[0, 1] = smooth[0]
-    cp[-1, 1] = smooth[-1]
+    cp[0, 1] = raw[0]
+    cp[-1, 1] = raw[-1]
     return cp
 
 
@@ -261,28 +327,15 @@ def erb_to_frequency(erb):
     return (erb / 24.7 - 1) * 1000 / 4.37
 
 
-def get_erb_bands(freq_min=20, freq_max=20000, n_bands=24):
-    """
-    Divide the frequency range into ERB-based bands.
-
-    Parameters:
-        freq_min (float): Minimum frequency in Hz.
-        freq_max (float): Maximum frequency in Hz.
-        n_bands (int): Number of bands to create.
-
-    Returns:
-        erb_bounds (np.ndarray): ERB bounds for the bands.
-        centers (np.ndarray): Center frequencies (geometric mean of bounds) for each band.
-    """
+def get_erb_bands(freq_min=20, freq_max=20000, n_bands=42):
     erb_min = frequency_to_erb(freq_min)
     erb_max = frequency_to_erb(freq_max)
-    # Create evenly spaced ERB boundaries
     erb_bounds = np.linspace(erb_min, erb_max, n_bands + 1)
-    # Convert ERB bounds back to Hz
-    bounds_hz = np.array([erb_to_frequency(b) for b in erb_bounds])
-    # Compute geometric mean for each band as its center
-    centers = np.array([np.sqrt(bounds_hz[i] * bounds_hz[i+1]) for i in range(len(bounds_hz)-1)])
-    return erb_bounds, centers
+    # convert back to Hz so that masking in calculate_band_sd uses the same units as freqs[]
+    bounds_hz = np.array([erb_to_frequency(e) for e in erb_bounds])
+    centers = np.sqrt(bounds_hz[:-1] * bounds_hz[1:])
+    return bounds_hz, centers
+
 
 
 def calculate_band_sd(freqs, orig, recon, erb_bounds):
@@ -363,7 +416,7 @@ def find_control_points_via_second_derivative(freqs, mag, threshold=0.1):
     return indices
 
 
-def refine_cp_by_segment(cp, freqs, smooth, method='pchip', seg_thresh=0.9, min_distance=5):
+def refine_cp_by_segment(cp, freqs, raw, method='pchip', seg_thresh=0.9, min_distance=5):
     """
     Refine control points by checking segments for excessive error and inserting new control points.
 
@@ -385,8 +438,8 @@ def refine_cp_by_segment(cp, freqs, smooth, method='pchip', seg_thresh=0.9, min_
         - Endpoints are enforced after each insertion.
     """
     cp = cp.copy()
-    cp[0, 1] = smooth[0]
-    cp[-1, 1] = smooth[-1]
+    cp[0, 1] = raw[0]
+    cp[-1, 1] = raw[-1]
     improved = True
     while improved:
         improved = False
@@ -395,28 +448,28 @@ def refine_cp_by_segment(cp, freqs, smooth, method='pchip', seg_thresh=0.9, min_
         # Loop over each adjacent pair of control points
         for i in range(len(cp) - 1):
             low_f, high_f = cp[i, 0], cp[i+1, 0]
-            seg_err = calc_segment_error(freqs, smooth, recon, low_f, high_f)
+            seg_err = calc_segment_error(freqs, raw, recon, low_f, high_f)
             # If segment error exceeds threshold, insert a new control point in that segment
             if seg_err > seg_thresh * 1.2:
                 mask = (freqs >= low_f) & (freqs <= high_f)
                 if not np.any(mask):
                     continue
                 seg_freqs = freqs[mask]
-                seg_errs = np.abs(smooth[mask] - recon[mask])
+                seg_errs = np.abs(raw[mask] - recon[mask])
                 idx = np.argmax(seg_errs)
                 new_f = seg_freqs[idx]
-                new_m = smooth[mask][idx]
+                new_m = raw[mask][idx]
                 # Only add if the new frequency is sufficiently separated from existing control points
                 if all(np.abs(new_f - existing_cp[0]) > min_distance for existing_cp in cp):
                     cp = np.vstack([cp, [new_f, new_m]])
                     improved = True
                     break
         if improved:
-            cp = enforce_endpoints(cp, freqs, smooth)
+            cp = enforce_endpoints(cp, freqs, raw)
     return cp
 
 
-def enhanced_prune_control_points(cp, freqs, smooth, method='pchip', threshold=1.0, dense_factor=12):
+def enhanced_prune_control_points(cp, freqs, raw, method='pchip', threshold=1.0, dense_factor=12):
     """
     Prune redundant control points while keeping the reconstruction error within a threshold.
 
@@ -440,7 +493,7 @@ def enhanced_prune_control_points(cp, freqs, smooth, method='pchip', threshold=1
     cp = cp.copy()
     # Create a dense frequency grid for accurate error evaluation
     dense_grid = np.linspace(freqs[0], freqs[-1], len(freqs) * dense_factor)
-    baseline = np.interp(dense_grid, freqs, smooth)
+    baseline = np.interp(dense_grid, freqs, raw)
     while True:
         cp = cp[np.argsort(cp[:, 0])]
         if len(cp) <= 2:
@@ -464,7 +517,7 @@ def enhanced_prune_control_points(cp, freqs, smooth, method='pchip', threshold=1
     return cp
 
 
-def erb_aware_pruning(cp, freqs, smooth, method='pchip', global_thresh=1.0):
+def erb_aware_pruning(cp, freqs, raw, method='pchip', global_thresh=1.0):
     """
     Prune control points based on ERB band-specific error thresholds.
 
@@ -482,7 +535,7 @@ def erb_aware_pruning(cp, freqs, smooth, method='pchip', global_thresh=1.0):
         - Determines ERB bands and sets thresholds that vary depending on the center frequency.
         - Iteratively removes a control point if the reconstruction error in all ERB bands stays below the threshold.
     """
-    erb_bounds, _ = get_erb_bands(20, 20000, 24)
+    erb_bounds, _ = get_erb_bands(20, 20000, 42)
     erb_thresholds = []
     # Set different thresholds based on frequency range
     for i in range(len(erb_bounds)-1):
@@ -502,7 +555,7 @@ def erb_aware_pruning(cp, freqs, smooth, method='pchip', global_thresh=1.0):
         for i in range(1, len(cp)-1):
             candidate = np.delete(cp, i, axis=0)
             _, recon = reconstruct_hrtf(candidate, method, freqs)
-            band_errors = calculate_band_sd(freqs, smooth, recon, erb_bounds)
+            band_errors = calculate_band_sd(freqs, raw, recon, erb_bounds)
             all_bands_ok = True
             for j, error in enumerate(band_errors):
                 if not np.isnan(error) and error > erb_thresholds[j]:
@@ -515,156 +568,217 @@ def erb_aware_pruning(cp, freqs, smooth, method='pchip', global_thresh=1.0):
     return cp
 
 
-def post_process_control_points(cp, freqs, smooth, method='pchip', error_tol=1.0):
-    """
-    Post-process control points by removing or merging points while maintaining the error tolerance.
+# def post_process_control_points(cp, freqs, raw, method='pchip', error_tol=1.0):
+#     """
+#     Post-process control points by removing or merging points while maintaining the error tolerance.
 
+#     Parameters:
+#         cp (np.ndarray): Array of control points.
+#         freqs (np.ndarray): Frequency grid.
+#         smooth (np.ndarray): Smoothed magnitude spectrum.
+#         method (str): Interpolation method.
+#         error_tol (float): Maximum allowed reconstruction error after processing.
+
+#     Returns:
+#         np.ndarray: Control points after post processing.
+
+#     How it works:
+#         - First attempts to remove a control point if doing so keeps the max error within tolerance.
+#         - If no removal is possible, attempts to merge adjacent control points.
+#         - Iterates until no further changes are possible.
+#     """
+#     changed = True
+#     while changed:
+#         changed = False
+#         cp = cp[np.argsort(cp[:, 0])]
+#         for i in range(1, len(cp) - 1):
+#             candidate = np.delete(cp, i, axis=0)
+#             _, recon = reconstruct_hrtf(candidate, method, freqs)
+#             max_err = np.max(np.abs(raw - recon))
+#             if max_err <= error_tol:
+#                 cp = candidate
+#                 changed = True
+#                 break
+#         if not changed:
+#             for i in range(1, len(cp) - 1):
+#                 merged_freq = np.sqrt(cp[i, 0] * cp[i+1, 0])
+#                 merged_mag = (cp[i, 1] + cp[i+1, 1]) / 2
+#                 candidate = np.delete(cp, i+1, axis=0)
+#                 candidate[i, :] = [merged_freq, merged_mag]
+#                 candidate = candidate[np.argsort(candidate[:, 0])]
+#                 _, recon = reconstruct_hrtf(candidate, method, freqs)
+#                 max_err = np.max(np.abs(raw - recon))
+#                 if max_err <= error_tol:
+#                     cp = candidate
+#                     changed = True
+#                     break
+#     return cp
+
+
+def optimized_prune_control_points_grid(cp, freqs, raw,
+                                        method='pchip',
+                                        error_tol=1.0,
+                                        grid_size=50,
+                                        max_iters=5000):
+    """
+    Grid-based pruning of control points: tries to remove points while keeping
+    max reconstruction error ≤ error_tol. Does NOT re-add points if error exceeds tol.
+    
     Parameters:
-        cp (np.ndarray): Array of control points.
-        freqs (np.ndarray): Frequency grid.
-        smooth (np.ndarray): Smoothed magnitude spectrum.
-        method (str): Interpolation method.
-        error_tol (float): Maximum allowed reconstruction error after processing.
-
+        cp         (ndarray): initial control points, shape (M,2)
+        freqs      (ndarray): full frequency grid
+        raw        (ndarray): original magnitude spectrum
+        method     (str)    : interpolation method, 'pchip' or 'cubic'
+        error_tol  (float)  : max allowed abs error
+        grid_size  (int)    : number of candidates between each pair
+        max_iters  (int)    : safeguard on total iterations
+    
     Returns:
-        np.ndarray: Control points after post processing.
-
-    How it works:
-        - First attempts to remove a control point if doing so keeps the max error within tolerance.
-        - If no removal is possible, attempts to merge adjacent control points.
-        - Iterates until no further changes are possible.
+        merged_cp  (ndarray): pruned control points
     """
-    changed = True
-    while changed:
-        changed = False
-        cp = cp[np.argsort(cp[:, 0])]
-        # Try removal of one point at a time
-        for i in range(1, len(cp) - 1):
-            candidate = np.delete(cp, i, axis=0)
-            _, recon = reconstruct_hrtf(candidate, method, freqs)
-            max_err = np.max(np.abs(smooth - recon))
-            if max_err <= error_tol:
-                cp = candidate
-                changed = True
-                break
-        # If no removal was successful, try merging adjacent points
-        if not changed:
-            for i in range(1, len(cp) - 1):
-                merged_freq = np.sqrt(cp[i, 0] * cp[i+1, 0])
-                merged_mag = (cp[i, 1] + cp[i+1, 1]) / 2
-                candidate = np.delete(cp, i+1, axis=0)
-                candidate[i, :] = [merged_freq, merged_mag]
-                candidate = candidate[np.argsort(candidate[:, 0])]
-                _, recon = reconstruct_hrtf(candidate, method, freqs)
-                max_err = np.max(np.abs(smooth - recon))
-                if max_err <= error_tol:
-                    cp = candidate
-                    changed = True
-                    break
-    return cp
-
-
-def optimized_merge_control_points_grid(cp, freqs, smooth, method='pchip', error_tol=1.0, grid_size=50):
-    """
-    Merge control points by optimizing the position of new control points over a grid.
-
-    Parameters:
-        cp (np.ndarray): Current control points.
-        freqs (np.ndarray): Frequency grid.
-        smooth (np.ndarray): Smoothed magnitude spectrum.
-        method (str): Interpolation method.
-        error_tol (float): Maximum allowed error tolerance.
-        grid_size (int): Number of candidate frequencies between each pair of control points.
-
-    Returns:
-        np.ndarray: Control points after merging based on grid optimization.
-
-    How it works:
-        - For each adjacent control point pair, candidate new points are evaluated on a dense grid.
-        - The candidate with the minimum error (if within tolerance) is inserted between the points.
-        - Otherwise, the next point is simply added.
-    """
-    cp = cp[np.argsort(cp[:, 0])]
-    new_cp = [cp[0]]
+    # 1) sort and initialize
+    cp = cp[np.argsort(cp[:,0])]
+    new_cp = [cp[0].tolist()]
     i = 0
-    while i < len(cp) - 1:
-        p1 = cp[i]
-        p2 = cp[i+1]
-        # Generate candidate frequencies between the current two points
+    iters = 0
+
+    # 2) try removing points via grid-based search
+    while i < len(cp)-1 and iters < max_iters:
+        iters += 1
+        p1, p2 = cp[i], cp[i+1]
         candidates = np.linspace(p1[0], p2[0], grid_size)
         candidate_errors = []
+
         for cf in candidates:
-            # Interpolate the magnitude at the candidate frequency
-            cand_mag = np.interp(cf, freqs, smooth)
-            candidate_set = np.vstack((np.array(new_cp, dtype=float),
-                                        np.array([[cf, cand_mag]], dtype=float),
-                                        cp[i+2:]))
-            candidate_set = candidate_set[np.argsort(candidate_set[:, 0])]
-            # Ensure the candidate set is valid (monotonic frequencies)
-            if np.any(np.diff(candidate_set[:, 0]) <= 0):
-                err_val = np.inf
-            else:
-                candidate_set = np.unique(candidate_set, axis=0)
-                if candidate_set.shape[0] < 2:
-                    err_val = np.inf
-                else:
-                    _, recon_candidate = reconstruct_hrtf(candidate_set, method, freqs)
-                    err_val = np.max(np.abs(smooth - recon_candidate))
-            candidate_errors.append(err_val)
+            mag_cf = float(np.interp(cf, freqs, raw))
+            # build candidate set: new_cp + this cf + remaining originals
+            cand_set = np.vstack([ new_cp,
+                                   [cf, mag_cf],
+                                   cp[i+2:] ])
+            cand_set = cand_set[np.argsort(cand_set[:,0])]
+            # compute error
+            _, recon = reconstruct_hrtf(cand_set, method, freqs)
+            e = np.max(np.abs(raw - recon))
+            candidate_errors.append(e)
+
         candidate_errors = np.array(candidate_errors)
         min_err = candidate_errors.min()
         best_cf = candidates[candidate_errors.argmin()]
+        best_mag = float(np.interp(best_cf, freqs, raw))
+
         if min_err <= error_tol:
-            new_cp.append([best_cf, float(np.interp(best_cf, freqs, smooth))])
+            # accept the best candidate instead of cp[i+1]
+            new_cp.append([best_cf, best_mag])
             i += 2
         else:
-            new_cp.append(p2)
+            # keep the original cp[i+1]
+            new_cp.append(cp[i+1].tolist())
             i += 1
-    return np.array(new_cp)
+
+    # 3) finalize: ensure last endpoint
+    merged_cp = np.array(new_cp)
+    if merged_cp[-1,0] != cp[-1,0]:
+        merged_cp = np.vstack([merged_cp, cp[-1]])
+
+    return merged_cp
 
 
-def dp_merge_control_points(freqs, smooth, error_tol=1.0):
+
+
+def optimized_merge_control_points_grid(cp, freqs, raw,
+                                        method='pchip',
+                                        error_tol=1.0,
+                                        grid_size=50):
     """
-    Merge control points using a dynamic programming approach to minimize the number of points.
-
-    Parameters:
-        freqs (np.ndarray): Frequency grid.
-        smooth (np.ndarray): Smoothed magnitude spectrum.
-        error_tol (float): Maximum allowed error for each segment.
-
-    Returns:
-        np.ndarray: Merged control points as a two-column array [frequency, magnitude].
-
-    How it works:
-        - Uses dynamic programming (DP) to decide which points to keep such that the error remains within tolerance.
-        - The DP array stores the minimum number of segments needed from each index.
+    Merge control points by optimizing the position of new control points over a grid,
+    then enforce a maximum absolute error tolerance by inserting worst-offending bins.
+    Includes safeguards against infinite loops and ensures at least two control points.
     """
-    N = len(freqs)
-    dp = [np.inf] * N
-    parent = [-1] * N
-    dp[N-1] = 0
-    # Backward dynamic programming to decide segmentation
-    for i in range(N-2, -1, -1):
-        for j in range(i+1, N):
-            seg_freqs = freqs[i:j+1]
-            interp = PchipInterpolator([freqs[i], freqs[j]], [smooth[i], smooth[j]])
-            recon_seg = interp(seg_freqs)
-            err = np.max(np.abs(smooth[i:j+1] - recon_seg))
-            if err <= error_tol:
-                if 1 + dp[j] < dp[i]:
-                    dp[i] = 1 + dp[j]
-                    parent[i] = j
-    indices = []
+    # 1) sort and initialize
+    cp = cp[np.argsort(cp[:, 0])]
+    new_cp = [cp[0]]
     i = 0
-    while i != -1 and i < N:
-        indices.append(i)
-        i = parent[i]
-        if i == -1:
-            break
-    return np.column_stack((freqs[indices], smooth[indices]))
+    err_val = float('inf')
+    # max_iters = len(cp) * grid_size * 2  # safeguard against infinite loops
+    max_iters = min(len(cp) * grid_size, 5000)
+
+    iters = 0
+
+    # 2) grid-based merge loop: step through adjacent pairs while error > tol
+    while i < len(cp) - 1 and err_val > error_tol and iters < max_iters:
+        iters += 1
+        p1, p2 = cp[i], cp[i+1]
+        candidates = np.linspace(p1[0], p2[0], grid_size)
+        candidate_errors = []
+
+        for cf in candidates:
+            cand_mag = np.interp(cf, freqs, raw)
+            candidate_set = np.vstack([new_cp,
+                                        [cf, cand_mag],
+                                        cp[i+2:]])
+            candidate_set = candidate_set[np.argsort(candidate_set[:, 0])]
+
+            # invalid candidate sets get infinite error
+            if np.any(np.diff(candidate_set[:, 0]) <= 0) or candidate_set.shape[0] < 2:
+                e = float('inf')
+            else:
+                _, recon = reconstruct_hrtf(candidate_set, method, freqs)
+                e = np.max(np.abs(raw - recon))
+            candidate_errors.append(e)
+
+        candidate_errors = np.array(candidate_errors)
+        min_err = candidate_errors.min()
+        best_cf = candidates[candidate_errors.argmin()]
+
+        if min_err > error_tol:
+            # back-track but don't go below zero
+            i = max(0, i - 1)
+            new_cp.pop()
+            new_cp.append(cp[i])
+            err_val = min_err
+            continue
+
+        # insert the best new point or the next original point
+        if min_err <= error_tol:
+            new_cp.append([best_cf, float(np.interp(best_cf, freqs, raw))])
+            i += 2
+        else:
+            new_cp.append(cp[i+1])
+            i += 1
+
+        err_val = min_err
+
+    # 3) finalize merged control points and ensure endpoints
+    merged_cp = np.array(new_cp)
+    # ensure at least two control points
+    if merged_cp.shape[0] < 2:
+        merged_cp = cp.copy()
+    else:
+        # enforce original endpoints
+        if merged_cp[0, 0] != cp[0, 0]:
+            merged_cp = np.vstack([cp[0], merged_cp])
+        if merged_cp[-1, 0] != cp[-1, 0]:
+            merged_cp = np.vstack([merged_cp, cp[-1]])
+
+    # 4) ensure reconstruction error ≤ tolerance by inserting worst bins
+    _, recon = reconstruct_hrtf(merged_cp, method, freqs)
+    max_err = np.max(np.abs(raw - recon))
+
+    while max_err > error_tol:
+        idx = np.argmax(np.abs(raw - recon))
+        new_pt = [freqs[idx], raw[idx]]
+        merged_cp = np.vstack([merged_cp, new_pt])
+        merged_cp = merged_cp[np.argsort(merged_cp[:, 0])]
+        _, recon = reconstruct_hrtf(merged_cp, method, freqs)
+        max_err = np.max(np.abs(raw - recon))
+
+    return merged_cp
 
 
-def combined_merge_control_points(cp, freqs, smooth, spline_method='pchip', error_tol=1.0):
+
+
+
+def combined_merge_control_points(cp, freqs, raw, spline_method='pchip', error_tol=1.0):
     """
     Combine two merging strategies (grid-based and DP-based) and select the one with fewer points.
 
@@ -682,15 +796,16 @@ def combined_merge_control_points(cp, freqs, smooth, spline_method='pchip', erro
         - Computes control points using both optimized grid merging and dynamic programming merging.
         - Returns the set with fewer control points.
     """
-    cp_grid = optimized_merge_control_points_grid(cp, freqs, smooth, method=spline_method, error_tol=error_tol, grid_size=50)
-    cp_dp = dp_merge_control_points(freqs, smooth, error_tol=error_tol)
-    if len(cp_dp) < len(cp_grid):
-        return cp_dp
-    else:
-        return cp_grid
+    cp_grid = optimized_merge_control_points_grid(cp, freqs, raw, method=spline_method, error_tol=error_tol, grid_size=50)
+    # cp_dp = dp_merge_control_points(freqs, raw, error_tol=error_tol)
+    # print(f"Grid-based control points: {len(cp_grid)}, DP-based control points: {len(cp_dp)}")
+    # if len(cp_dp) < len(cp_grid):
+    #     return cp_dp
+    # else:
+    return cp_grid
 
 
-def post_process_control_points(cp, freqs, smooth, method='pchip', error_tol=1.0):
+def post_process_control_points(cp, freqs, raw, method='pchip', error_tol=1.0):
     """
     Post-process control points by removing or merging points while maintaining the error tolerance.
 
@@ -711,9 +826,10 @@ def post_process_control_points(cp, freqs, smooth, method='pchip', error_tol=1.0
         for i in range(1, len(cp) - 1):
             candidate = np.delete(cp, i, axis=0)
             _, recon = reconstruct_hrtf(candidate, method, freqs)
-            max_err = np.max(np.abs(smooth - recon))
+            max_err = np.max(np.abs(raw - recon))
             if max_err <= error_tol:
                 cp = candidate
+                # print(f" max_err <= error_tol Removed control point at index {i}, new count: {len(cp)}")
                 changed = True
                 break
         if not changed:
@@ -724,122 +840,399 @@ def post_process_control_points(cp, freqs, smooth, method='pchip', error_tol=1.0
                 candidate[i, :] = [merged_freq, merged_mag]
                 candidate = candidate[np.argsort(candidate[:, 0])]
                 _, recon = reconstruct_hrtf(candidate, method, freqs)
-                max_err = np.max(np.abs(smooth - recon))
+                max_err = np.max(np.abs(raw - recon))
                 if max_err <= error_tol:
                     cp = candidate
                     changed = True
                     break
+    # print(f"FINAL: Post-processing control points, current count: {len(cp)}")
     return cp
 
 
 # -----------------------------
 # Adaptive HRTF Compression// Need Fixes, OLD Parameters still in here even tho not used anymore
 # -----------------------------
-def adaptive_compress_hrtf(ir, fs, fft_len=1024, init_pts=10, global_thresh=1.0,
-                           local_thresh=1.0, max_pts=100, win_size=11, err_thresh=1.0,
-                           alt_win=7, noise=1e-1, spline_method='pchip',
-                           n_bands=24, seg_thresh=0.9, err_bound=0.99):
+# Add these new functions to your Code 1 imports and function definitions section
+# (Right after the existing control point processing functions)
+
+def dp_optimize_control_points_fixed(freqs, raw, error_tol=1.0, method='pchip'):
+    """
+    Use dynamic programming to find minimum control points with correct interpolation
+    """
+    N = len(freqs)
+    dp = [float('inf')] * N
+    parent = [-1] * N
+    dp[N-1] = 0
+    
+    # Pre-compute valid segments to avoid redundant calculations
+    valid_segments = {}
+    
+    for i in range(N-2, -1, -1):
+        for j in range(i+1, N):
+            # Create segment from i to j
+            if j - i == 1:
+                # Adjacent points - always acceptable with 0 error
+                segment_error = 0.0
+            else:
+                # Check if we already computed this segment
+                seg_key = (i, j)
+                if seg_key not in valid_segments:
+                    # Build control points for this segment
+                    segment_cp = np.column_stack((freqs[i:j+1:max(1, (j-i)//10)], 
+                                                raw[i:j+1:max(1, (j-i)//10)]))
+                    # Ensure endpoints are included
+                    if segment_cp[0, 0] != freqs[i]:
+                        segment_cp = np.vstack([[freqs[i], raw[i]], segment_cp])
+                    if segment_cp[-1, 0] != freqs[j]:
+                        segment_cp = np.vstack([segment_cp, [freqs[j], raw[j]]])
+                    
+                    # Remove duplicates and sort
+                    segment_cp = np.unique(segment_cp, axis=0)
+                    segment_cp = segment_cp[np.argsort(segment_cp[:, 0])]
+                    
+                    if len(segment_cp) < 2:
+                        segment_error = float('inf')
+                    else:
+                        try:
+                            # Use the same interpolation method as final reconstruction
+                            if method == 'cubic':
+                                interp = CubicSpline(segment_cp[:, 0], segment_cp[:, 1], extrapolate=True)
+                            else:
+                                interp = PchipInterpolator(segment_cp[:, 0], segment_cp[:, 1], extrapolate=True)
+                            
+                            seg_recon = interp(freqs[i:j+1])
+                            segment_error = np.max(np.abs(raw[i:j+1] - seg_recon))
+                        except:
+                            segment_error = float('inf')
+                    
+                    valid_segments[seg_key] = segment_error
+                else:
+                    segment_error = valid_segments[seg_key]
+            
+            # Update DP if this segment is valid and improves the solution
+            if segment_error <= error_tol and 1 + dp[j] < dp[i]:
+                dp[i] = 1 + dp[j]
+                parent[i] = j
+    
+    # Reconstruct optimal path
+    indices = []
+    i = 0
+    while i != -1 and i < N:
+        indices.append(i)
+        i = parent[i]
+        if i == -1:
+            break
+    
+    if len(indices) < 2:
+        # Fallback: return endpoints
+        return np.column_stack(([freqs[0], freqs[-1]], [raw[0], raw[-1]]))
+    
+    return np.column_stack((freqs[indices], raw[indices]))
+
+
+
+def aggressive_prune_control_points_enhanced(cp, freqs, raw, method='pchip', error_tol=1.0, max_iterations=20):
+    """
+    Enhanced aggressive pruning with better merging strategies
+    """
+    cp = cp[np.argsort(cp[:, 0])]
+    
+    # Remove duplicates
+    cp = np.unique(cp, axis=0)
+    
+    if len(cp) < 2:
+        return np.column_stack(([freqs[0], freqs[-1]], [raw[0], raw[-1]]))
+    
+    changed = True
+    iterations = 0
+    
+    while changed and len(cp) > 2 and iterations < max_iterations:
+        changed = False
+        iterations += 1
+        best_removal = None
+        best_error_increase = float('inf')
+        
+        # Get current reconstruction error
+        _, baseline_recon = reconstruct_hrtf(cp, method, freqs)
+        baseline_error = np.max(np.abs(raw - baseline_recon))
+        
+        # Try removing each interior point
+        for i in range(1, len(cp) - 1):
+            candidate = np.delete(cp, i, axis=0)
+            _, recon = reconstruct_hrtf(candidate, method, freqs)
+            max_err = np.max(np.abs(raw - recon))
+            error_increase = max_err - baseline_error
+            
+            if max_err <= error_tol and error_increase < best_error_increase:
+                best_error_increase = error_increase
+                best_removal = i
+        
+        if best_removal is not None:
+            cp = np.delete(cp, best_removal, axis=0)
+            changed = True
+            continue
+        
+        # If no single removal works, try merging adjacent points
+        best_merge = None
+        best_error_increase = float('inf')
+        
+        for i in range(len(cp) - 1):
+            # Try different merging strategies
+            merge_strategies = [
+                # Geometric mean freq, arithmetic mean mag
+                (np.sqrt(cp[i, 0] * cp[i+1, 0]), (cp[i, 1] + cp[i+1, 1]) / 2),
+                # Arithmetic mean for both
+                ((cp[i, 0] + cp[i+1, 0]) / 2, (cp[i, 1] + cp[i+1, 1]) / 2),
+            ]
+            
+            for merged_freq, merged_mag in merge_strategies:
+                candidate = cp.copy()
+                candidate[i] = [merged_freq, merged_mag]
+                candidate = np.delete(candidate, i+1, axis=0)
+                
+                try:
+                    _, recon = reconstruct_hrtf(candidate, method, freqs)
+                    max_err = np.max(np.abs(raw - recon))
+                    error_increase = max_err - baseline_error
+                    
+                    if max_err <= error_tol and error_increase < best_error_increase:
+                        best_error_increase = error_increase
+                        best_merge = (i, merged_freq, merged_mag)
+                        break
+                except:
+                    continue
+        
+        if best_merge is not None:
+            i, merged_freq, merged_mag = best_merge
+            cp[i] = [merged_freq, merged_mag]
+            cp = np.delete(cp, i+1, axis=0)
+            changed = True
+    
+    return cp
+
+
+
+
+def dp_optimize_with_validation(freqs, raw, error_tol=1.0, method='pchip', max_attempts=5):
+    """
+    DP optimization with iterative refinement if error exceeds tolerance
+    """
+    current_tol = error_tol * 0.8  # Start with stricter tolerance
+    
+    for attempt in range(max_attempts):
+        cp = dp_optimize_control_points_fixed(freqs, raw, current_tol, method)
+        
+        # Validate the result
+        _, recon = reconstruct_hrtf(cp, method, freqs)
+        actual_error = np.max(np.abs(raw - recon))
+        
+        # print(f"Attempt {attempt + 1}: {len(cp)} control points, error = {actual_error:.3f}")
+        
+        if actual_error <= error_tol:
+            return cp
+        
+        # If error too high, be more conservative
+        current_tol *= 0.7
+        
+        # Also try adding intermediate points where error is highest
+        if attempt < max_attempts - 1:
+            error_diff = np.abs(raw - recon)
+            worst_indices = np.argsort(error_diff)[-5:]  # Top 5 worst errors
+            
+            # Add some intermediate points
+            additional_points = []
+            for idx in worst_indices:
+                if not np.any(np.isclose(cp[:, 0], freqs[idx], atol=1e-5)):
+                    additional_points.append([freqs[idx], raw[idx]])
+            
+            if additional_points:
+                cp = np.vstack([cp, additional_points])
+                cp = cp[np.argsort(cp[:, 0])]
+    
+    # Final fallback: use aggressive pruning instead
+    # print("DP failed, falling back to aggressive pruning")
+    return aggressive_prune_control_points_enhanced(cp, freqs, raw, method, error_tol)
+
+
+
+
+
+def multi_strategy_optimize(freqs, raw, error_tol=1.0, method='pchip'):
+    """
+    Try multiple optimization strategies and return the best one
+    """
+    # print(f"Starting multi-strategy optimization with {len(freqs)} frequency points")
+    
+    strategies = []
+    
+    # Strategy 1: Enhanced aggressive pruning on current control points
+    def strategy_aggressive(cp_input):
+        return aggressive_prune_control_points_enhanced(cp_input, freqs, raw, method, error_tol)
+    
+    # Strategy 2: DP with validation
+    def strategy_dp():
+        return dp_optimize_with_validation(freqs, raw, error_tol, method)
+    
+    # Strategy 3: Hybrid coarse-to-fine
+    def strategy_hybrid():
+        # Start with coarse sampling
+        N = len(freqs)
+        initial_step = max(N // 15, 1)
+        indices = list(range(0, N, initial_step))
+        if indices[-1] != N-1:
+            indices.append(N-1)
+        
+        cp = np.column_stack((freqs[indices], raw[indices]))
+        
+        # Iteratively add worst-error points
+        max_iterations = 30
+        for iteration in range(max_iterations):
+            _, recon = reconstruct_hrtf(cp, method, freqs)
+            error = np.abs(raw - recon)
+            max_error = np.max(error)
+            
+            if max_error <= error_tol:
+                break
+            
+            # Add worst error points
+            cp_freq_set = set(cp[:, 0])
+            candidates = []
+            
+            for i in np.argsort(error)[::-1]:
+                if freqs[i] not in cp_freq_set and error[i] > error_tol * 0.3:
+                    candidates.append((freqs[i], raw[i]))
+                    if len(candidates) >= 2:
+                        break
+            
+            if not candidates:
+                break
+            
+            new_points = np.array(candidates)
+            cp = np.vstack([cp, new_points])
+            cp = cp[np.argsort(cp[:, 0])]
+        
+        # Final pruning
+        return aggressive_prune_control_points_enhanced(cp, freqs, raw, method, error_tol)
+    
+    # Test strategies
+    strategies_to_try = [
+        # ("DP with Validation", strategy_dp),
+        # ("Hybrid Coarse-to-Fine", strategy_hybrid),
+    ]
+    
+    best_cp = None
+    best_count = float('inf')
+    best_strategy = None
+    
+    for strategy_name, strategy_func in strategies_to_try:
+        try:
+            # print(f"Trying {strategy_name}...")
+            cp = strategy_func()
+            
+            # Validate result
+            _, recon = reconstruct_hrtf(cp, method, freqs)
+            actual_error = np.max(np.abs(raw - recon))
+            
+            # print(f"{strategy_name}: {len(cp)} points, error = {actual_error:.3f}")
+            
+            if actual_error <= error_tol and len(cp) < best_count:
+                best_cp = cp
+                best_count = len(cp)
+                best_strategy = strategy_name
+                
+        except Exception as e:
+            print(f"{strategy_name} failed: {e}")
+    
+    # print(f"Best strategy: {best_strategy} with {best_count} control points")
+    return best_cp if best_cp is not None else np.column_stack(([freqs[0], freqs[-1]], [raw[0], raw[-1]]))
+
+
+# MODIFIED adaptive_compress_hrtf function - REPLACE the existing one in Code 1
+def adaptive_compress_hrtf(ir, fs, fft_len=1024,
+                           init_pts=10, global_thresh=1.0, local_thresh=1.0, max_pts=100,
+                           win_size=11, err_thresh=1.0, alt_win=7, noise=1e-1,
+                           spline_method='pchip',
+                           smooth_method='wiener',
+                           n_bands=42, frac_oct=3, lifter_len=20,
+                           seg_thresh=0.9, err_bound=0.99):
     """
     Compress a single HRTF measurement using an adaptive control point selection scheme.
-
-    Parameters:
-        ir (np.ndarray): Impulse response for one measurement.
-        fs (float): Sampling rate.
-        fft_len (int): FFT length to use.
-        init_pts (int): Minimum number of initial control points.
-        global_thresh (float): Global error threshold for pruning.
-        local_thresh (float): Local error threshold (not directly used here).
-        max_pts (int): Maximum allowed control points.
-        win_size (int): Window size for Wiener filtering.
-        err_thresh (float): Error threshold for adaptive filtering.
-        alt_win (int): Alternative window size for adaptive filtering.
-        noise (float): Noise level estimate.
-        spline_method (str): Interpolation method ('pchip' or 'cubic').
-        n_bands (int): Number of ERB bands for spectral analysis.
-        seg_thresh (float): Segment error threshold for refinement.
-        err_bound (float): Error bound for iterative control point addition.
-
-    Returns:
-        dict: Dictionary containing:
-            - frequencies: Frequency grid used.
-            - raw_mag: Raw magnitude spectrum (in dB).
-            - smoothed_mag: Smoothed magnitude after filtering.
-            - control_points: Final control points [frequency, magnitude].
-            - reconstructed: Reconstructed magnitude spectrum.
-            - spectral_distortion: Overall spectral distortion (RMSE).
-            - num_control_points: Final number of control points.
-            - points_added: Number of points added compared to initial selection.
-            - points_removed: Number of points removed compared to initial selection.
-
-    How it works:
-        1. Computes the frequency response from the impulse response.
-        2. Applies an adaptive Wiener filter to smooth the magnitude response.
-        3. Identifies initial control points via second derivative analysis.
-        4. If not enough initial points are found, extra points are added uniformly.
-        5. Endpoints are enforced and then iterative refinement, pruning, and merging is performed.
-        6. Finally, the reconstruction error is checked and additional control points are added if necessary.
     """
     # Compute the frequency response and convert to dB scale
     freqs, mag = compute_frequency_response(ir, fs, fft_len)
-    # Apply adaptive Wiener filtering to smooth the magnitude response
-    smooth = apply_filter(mag, win_size, err_thresh, alt_win, noise)
+
+    # Apply adaptive filtering to smooth the magnitude response
+    smooth = apply_filter(mag, freqs=freqs, method=smooth_method,
+                          win_size=win_size, err_thresh=err_thresh, alt_win=alt_win, noise=noise,
+                          n_bands=n_bands, frac_oct=frac_oct, lifter_len=lifter_len)
+
     raw = mag.copy()
-    # Identify initial control point indices using second derivative analysis
+
+    # Find control points using the smoothed magnitude spectrum
     cp_idx = find_control_points_via_second_derivative(freqs, smooth, threshold=0.1)
     cp_freqs = freqs[cp_idx]
-    cp_mags = smooth[cp_idx]
-    # If not enough control points, add extra uniformly spaced points
-    if len(cp_freqs) < init_pts:
-        extra_idx = np.linspace(0, len(freqs)-1, init_pts, dtype=int)
-        cp_freqs = np.unique(np.concatenate((cp_freqs, freqs[extra_idx])))
-        cp_freqs = np.sort(cp_freqs)
-        cp_mags = np.interp(cp_freqs, freqs, smooth)
-    # Ensure endpoints match exactly
-    cp_freqs[0], cp_mags[0] = freqs[0], smooth[0]
-    cp_freqs[-1], cp_mags[-1] = freqs[-1], smooth[-1]
+    cp_mags = mag[cp_idx]
+
+    # Combine frequency and magnitude into control points
     cp = np.column_stack((cp_freqs, cp_mags))
-    
+
+    # Ensure endpoints match exactly
+    cp_freqs[0], cp_mags[0] = freqs[0], raw[0]
+    cp_freqs[-1], cp_mags[-1] = freqs[-1], raw[-1]
+    cp = np.column_stack((cp_freqs, cp_mags))
+
     # Record the initial number of control points
     initial_cp_count = len(cp)
-    
-    # Iteratively refine and prune control points using several methods
-    cp = refine_cp_by_segment(cp, freqs, smooth, spline_method, seg_thresh, min_distance=5)
-    cp = enforce_endpoints(cp, freqs, smooth)
-    cp = enhanced_prune_control_points(cp, freqs, smooth, method=spline_method, threshold=global_thresh, dense_factor=12)
-    cp = enforce_endpoints(cp, freqs, smooth)
-    cp = erb_aware_pruning(cp, freqs, smooth, method=spline_method, global_thresh=global_thresh)
-    cp = enforce_endpoints(cp, freqs, smooth)
-    cp = enhanced_prune_control_points(cp, freqs, smooth, method=spline_method, threshold=global_thresh*0.95, dense_factor=12)
-    cp = enforce_endpoints(cp, freqs, smooth)
-    
-    # Reconstruct the magnitude response from the refined control points
+
+    # Initial refinement and pruning
+    cp = refine_cp_by_segment(cp, freqs, raw, spline_method, seg_thresh, min_distance=5)
+    cp = enforce_endpoints(cp, freqs, raw)
+    cp = enhanced_prune_control_points(cp, freqs, raw, method=spline_method, threshold=global_thresh, dense_factor=12)
+    cp = enforce_endpoints(cp, freqs, raw)
+    cp = erb_aware_pruning(cp, freqs, raw, method=spline_method, global_thresh=global_thresh)
+    cp = enforce_endpoints(cp, freqs, raw)
+
+    # Apply the new multi-strategy optimization instead of the old merging
+    # print(f"Before multi-strategy optimization: {len(cp)} control points")
+    cp = multi_strategy_optimize(freqs, raw, error_tol=1.0, method=spline_method)
+    # print(f"After multi-strategy optimization: {len(cp)} control points")
+
+    # Final reconstruction and validation
     _, recon = reconstruct_hrtf(cp, spline_method, freqs)
-    max_abs_error = np.max(np.abs(smooth - recon))
-    # If error is too high, add additional control points iteratively
-    while max_abs_error > 1.0:
-        error = smooth - recon
+    max_abs_error = np.max(np.abs(raw - recon))
+
+    # If error is still too high, add points iteratively (safety net)
+    safety_iterations = 0
+    while max_abs_error > 1.0 and safety_iterations < 10:
+        safety_iterations += 1
+        error = raw - recon
         idx = np.argmax(np.abs(error))
         if np.abs(error[idx]) > 1.0:
             new_freq = freqs[idx]
-            new_mag = smooth[idx]
+            new_mag = raw[idx]
             if not np.any(np.isclose(cp[:, 0], new_freq, atol=1e-5)):
                 cp = np.vstack([cp, [new_freq, new_mag]])
                 cp = cp[np.argsort(cp[:, 0])]
                 _, recon = reconstruct_hrtf(cp, spline_method, freqs)
-                max_abs_error = np.max(np.abs(smooth - recon))
+                max_abs_error = np.max(np.abs(raw - recon))
+                print(f"Safety net: Added point, now {len(cp)} control points, error = {max_abs_error:.3f}")
             else:
                 break
         else:
             break
 
-    cp = post_process_control_points(cp, freqs, smooth, method=spline_method, error_tol=1.0)
-    cp = combined_merge_control_points(cp, freqs, smooth, spline_method, error_tol=1.0)
+    # Final post-processing cleanup
+    cp = post_process_control_points(cp, freqs, raw, method=spline_method, error_tol=1.0)
     
+    # Final reconstruction for output
+    _, recon = reconstruct_hrtf(cp, spline_method, freqs)
     final_cp_count = len(cp)
     points_added = max(final_cp_count - initial_cp_count, 0)
     points_removed = max(initial_cp_count - final_cp_count, 0)
-    
-    sd = spectral_distortion(smooth, recon)
+    sd = spectral_distortion(raw, recon)
+
+    print(f"Final result: {final_cp_count} control points, error = {np.max(np.abs(raw - recon)):.3f}, SD = {sd:.3f}")
+
     return {
         'frequencies': freqs,
         'raw_mag': raw,
@@ -853,13 +1246,17 @@ def adaptive_compress_hrtf(ir, fs, fft_len=1024, init_pts=10, global_thresh=1.0,
     }
 
 
+
 # -----------------------------
 # SOFA File Handling
 # -----------------------------
-def compress_all_hrtfs(sofa_path, adaptive=True, init_pts=10, global_thresh=1.0,
+def compress_all_hrtfs(sofa_path, adaptive=True,
+                       init_pts=10, global_thresh=1.0,
                        max_pts=100, win_size=11, err_thresh=1.0, alt_win=7, noise=1e-1,
                        local_thresh=1.0, spline_method='pchip', fft_len=1024,
-                       n_bands=24, max_meas=5, seg_thresh=0.9, err_bound=0.99):
+                       n_bands=42, frac_oct=3, lifter_len=20,
+                       smooth_method='wiener',
+                       max_meas=5, seg_thresh=0.9, err_bound=0.99):
     """
     Process all HRTF measurements from a SOFA file and compress them using adaptive compression.
 
@@ -895,6 +1292,7 @@ def compress_all_hrtfs(sofa_path, adaptive=True, init_pts=10, global_thresh=1.0,
         print(f"Error opening SOFA file: {e}")
         sys.exit(1)
     fs = hrtf_db.Data.SamplingRate.get_values()
+    # print(f"Loaded {os.path.basename(sofa_path)}, sampling rate = {fs} Hz")
     total = hrtf_db.Source.Position.get_values().shape[0]
     if max_meas is not None and max_meas < total:
         total = max_meas
@@ -907,12 +1305,22 @@ def compress_all_hrtfs(sofa_path, adaptive=True, init_pts=10, global_thresh=1.0,
         left_ir = hrtf_db.Data.IR.get_values(indices={"M": m, "R": 0, "E": 0})
         right_ir = hrtf_db.Data.IR.get_values(indices={"M": m, "R": 1, "E": 0})
         if adaptive:
-            left_res = adaptive_compress_hrtf(left_ir, fs, fft_len, init_pts, global_thresh,
-                                              local_thresh, max_pts, win_size, err_thresh, alt_win, noise,
-                                              spline_method, n_bands, seg_thresh, err_bound)
-            right_res = adaptive_compress_hrtf(right_ir, fs, fft_len, init_pts, global_thresh,
-                                               local_thresh, max_pts, win_size, err_thresh, alt_win, noise,
-                                               spline_method, n_bands, seg_thresh, err_bound)
+            left_res = adaptive_compress_hrtf(
+                left_ir, fs, fft_len,
+                init_pts, global_thresh, local_thresh, max_pts,
+                win_size, err_thresh, alt_win, noise,
+                spline_method,
+                smooth_method,  # ← forward
+                n_bands, frac_oct, lifter_len,
+                seg_thresh, err_bound)
+            right_res = adaptive_compress_hrtf(
+                right_ir, fs, fft_len,
+                init_pts, global_thresh, local_thresh, max_pts,
+                win_size, err_thresh, alt_win, noise,
+                spline_method,
+                smooth_method,  # ← forward
+                n_bands, frac_oct, lifter_len,
+                seg_thresh, err_bound)
         else:
             left_res = None
             right_res = None
@@ -1066,7 +1474,7 @@ def plot_sd_boxplot(measurements, n_bands=24, az=None, el=None):
     title = "Spectral Distortion per ERB Band"
     if az is not None and el is not None:
         title += f" (Az: {az:.1f}°, Elev: {el:.1f}°)"
-    ax.set_ylim(0, 1.15)
+    ax.set_ylim(0, 1.1)
     ax.tick_params(axis='both', which='major', labelsize=25)
     n = len(erb_bounds) - 1
     tick_positions = list(range(1, n+1))
@@ -1101,6 +1509,7 @@ def plot_error_details(result, title_suffix="", az=None, el=None):
         title2 += extra
     ax1.semilogx(freqs, raw, 'b-', alpha=0.7, label="Original Data")
     ax1.semilogx(freqs, recon, 'r--', alpha=0.7, label="Reconstructed")
+    ax1.set_title(title1, fontsize=35)
     ax1.set_ylabel("Magnitude (dB)", fontsize=35)
     ax1.legend()
     ax1.tick_params(axis='both', which='major', labelsize=35)
@@ -1112,7 +1521,7 @@ def plot_error_details(result, title_suffix="", az=None, el=None):
     ax2.grid(True, which="both", linestyle="--", alpha=0.7)
     ax2.set_xlabel("Frequency (Hz)", fontsize=35)
     ax2.set_ylabel("Error (dB)", fontsize=35)
-    ax2.set_ylim(-1.5, 1.5)
+    ax2.set_ylim(-1.2, 1.2)
     plt.tight_layout()
     plt.show()
 
@@ -1142,7 +1551,7 @@ def plot_filtering_error(result, title_suffix="", az=None, el=None):
     ax.grid(True, which="both", linestyle="--", alpha=0.7)
     ax.tick_params(axis='both', which='major', labelsize=45)
     ax.legend()
-    ax.set_ylim(-0.75, 0.75)
+    ax.set_ylim(-0.5, 0.5)
     plt.show()
 
 
@@ -1168,7 +1577,7 @@ def plot_filtering_stats(result, title_suffix="", az=None, el=None):
         title += f" (Az: {az:.1f}°, Elev: {el:.1f}°)"
     ax.set_ylabel("Error (dB)", fontsize=35)
     ax.tick_params(axis='both', which='major', labelsize=45)
-    plt.ylim(0, 0.5)
+    plt.ylim(0, 1)
     print(f"ERROR AND DEVIA: {abs_err:.2f}, {std_err:.2f}")
     plt.show()
 
@@ -1214,41 +1623,32 @@ def plot_average_filtering_error(measurements):
     ax.set_xlabel("Frequency (Hz)", fontsize=30)
     ax.set_ylabel("Error (dB)", fontsize=30)
     ax.set_title("Average Filtering Error Across All Measurements", fontsize=35)    
-    ax.set_ylim(-0.2, 0.15)
+    ax.set_ylim(-0.5, 0.5)
     ax.tick_params(axis='both', which='major', labelsize=30)
     ax.legend()
     ax.grid(True, which="both", linestyle="--", alpha=0.7)
     plt.show()
 
 
-
 # -----------------------------
 # Main Interactive Interface
 # -----------------------------
 def main():
-    """
-    Main entry point for interactive HRTF compression and visualization.
-
-    Process:
-        - Checks for the existence of a SOFA file.
-        - Sets parameters for compression and filtering.
-        - Calls compress_all_hrtfs to process the SOFA file.
-        - Computes average compression ratio and filtering error statistics.
-        - Saves control points and compression rates to CSV files.
-        - Sets up an interactive Matplotlib figure with sliders and text boxes for exploring the results.
-    """
-    sofa_path = "src/sofa/minPhase_NoITD.sofa"
-    if not os.path.exists(sofa_path):
-        print(f"ERROR: SOFA file not found at '{sofa_path}'")
+    compressed_db_path = "src/sofa/testing"
+    os.makedirs(compressed_db_path, exist_ok=True)
+    sofa_dir = "src/sofa/"
+    sofa_files = glob.glob(os.path.join(sofa_dir, "*.sofa"))[:1]
+    if not sofa_files:
+        print(f"No SOFA files found in '{sofa_dir}'")
         sys.exit(1)
-    
+
     # Parameters for compression and filtering
     FFT_LEN = 1024
     SG_WINDOW = 3
     ERROR_THRESHOLD = 0.95
     ALT_WINDOW = 3
     NOISE_EST = 0.1
-    NUM_BANDS = 24
+    NUM_BANDS = 42
     INIT_POINTS = 10
     THRESHOLD_SD = 0.95
     LOCAL_THRESHOLD = 0.95
@@ -1256,231 +1656,41 @@ def main():
     SPLINE_KIND = 'pchip'
     SEGMENT_THRESHOLD = 0.9
     ERROR_BOUND = 0.95
-    adaptive = True
+    SMOOTH_METHOD = 'wiener'
     
-    # Compress all HRTF measurements from the SOFA file
-    compressed_db = compress_all_hrtfs(
-        sofa_path,
-        adaptive=adaptive,
-        init_pts=INIT_POINTS,
-        global_thresh=THRESHOLD_SD,
-        max_pts=MAX_POINTS,
-        win_size=SG_WINDOW,
-        err_thresh=ERROR_THRESHOLD,
-        alt_win=ALT_WINDOW,
-        noise=NOISE_EST,
-        local_thresh=LOCAL_THRESHOLD,
-        spline_method=SPLINE_KIND,
-        fft_len=FFT_LEN,
-        n_bands=NUM_BANDS,
-        max_meas=None,
-        seg_thresh=SEGMENT_THRESHOLD,
-        err_bound=ERROR_BOUND
+    all_left_results, all_right_results, all_positions, all_file_indices = [], [], [], []
+    def _run_file(sofa_path, file_idx):
+        print(f"Processing file {file_idx}: {os.path.basename(sofa_path)}")
+        compressed_db = compress_all_hrtfs(
+            sofa_path,
+            adaptive=True,
+            init_pts=INIT_POINTS,
+            global_thresh=THRESHOLD_SD,
+            max_pts=MAX_POINTS,
+            win_size=SG_WINDOW,
+            err_thresh=ERROR_THRESHOLD,
+            alt_win=ALT_WINDOW,
+            noise=NOISE_EST,
+            local_thresh=LOCAL_THRESHOLD,
+            spline_method=SPLINE_KIND,
+            fft_len=FFT_LEN,
+            n_bands=NUM_BANDS,
+            frac_oct=6,
+            lifter_len=80,
+            smooth_method=SMOOTH_METHOD,
+            max_meas=1,
+            seg_thresh=SEGMENT_THRESHOLD,
+            err_bound=ERROR_BOUND
+        )
+        file_name = os.path.basename(sofa_path)
+        with open(os.path.join(compressed_db_path, file_name.replace('sofa', 'pkl')), 'wb') as f:
+            pickle.dump(compressed_db, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return compressed_db
+    print('entring loop')
+    compressed_dbs = Parallel(n_jobs=50)(
+        delayed(_run_file)(sofa_path, file_idx)
+        for file_idx, sofa_path in tqdm(enumerate(sofa_files, start=1), total=len(sofa_files), desc="Processing SOFA files")
     )
-    print("Compression complete.")
     
-    left_results = compressed_db['left_results']
-    right_results = compressed_db['right_results']
-    positions = compressed_db.get('positions', None)  # Retrieve measurement positions from the SOFA file
-    num_meas = len(left_results)
-    
-    total_cp = 0
-    count = 0
-    for res in left_results + right_results:
-        if res is not None and 'num_control_points' in res:
-            total_cp += res['num_control_points']
-            count += 1
-    if count > 0:
-        avg_cp = total_cp / count
-        print(f"Average number of control points (both ears): {avg_cp:.2f}")
-    else:
-        print("No valid measurements found.")
-
-    
-    # Compute combined compression ratio for each measurement
-    freq_length = len(left_results[0]['frequencies'])
-    original_bytes = freq_length * 2 * 4  # 2 channels, 4 bytes each
-    combined_cr_list = []
-    for left_res, right_res in zip(left_results, right_results):
-        left_cp = left_res.get('num_control_points', 0)
-        right_cp = right_res.get('num_control_points', 0)
-        if left_cp > 0 and right_cp > 0:
-            total_bytes = (left_cp + right_cp) * 8  # each control point uses 8 bytes
-            combined_cr = original_bytes / total_bytes
-            combined_cr_list.append(combined_cr)
-    if combined_cr_list:
-        avg_combined_cr = np.mean(combined_cr_list)
-        print(f"Average Combined Compression Ratio: {avg_combined_cr:.2f}")
-    else:
-        print("No valid measurements for combined CR.")
-    
-    # Compute and print average filtering error statistics across all measurements
-    total_abs_error = 0.0
-    total_std_error = 0.0
-    for res in left_results:
-        err = res['smoothed_mag'] - res['raw_mag']
-        total_abs_error += np.max(np.abs(err))
-        total_std_error += np.std(err)
-    avg_abs_error = total_abs_error / num_meas
-    avg_std_error = total_std_error / num_meas
-    print(f"In average, the measurements have {avg_abs_error:.2f} dB absolute error and {avg_std_error:.2f} dB standard deviation after filtering.")
-    
-    # Save compression rates and control points to CSV files
-    save_compression_rates(compressed_db, "compression_rates.csv")
-    save_all_control_points(compressed_db, "all_control_points.csv")
-    
-    # Set up interactive plotting interface with Matplotlib
-    fig, ax = plt.subplots(figsize=(12, 6))
-    plt.subplots_adjust(left=0.1, bottom=0.42)
-    
-    def update_slider(val):
-        """
-        Update the reconstruction plot when the measurement slider is moved.
-        """
-        idx = int(meas_slider.val)
-        if positions is not None and positions.shape[0] > idx:
-            az = positions[idx, 0]
-            el = positions[idx, 1]
-        else:
-            az = el = None
-        plot_reconstruction(left_results[idx], ax, title_suffix=f"(Left Ear, Measurement {idx})", az=az, el=el)
-        fig.canvas.draw_idle()
-    
-    # Create a slider for selecting measurement index
-    slider_ax = plt.axes([0.15, 0.36, 0.7, 0.03])
-    meas_slider = Slider(slider_ax, 'Measurement', 0, num_meas - 1, valinit=0, valstep=1)
-    meas_slider.on_changed(update_slider)
-    
-    # Create a text box for triggering a spectral distortion boxplot
-    textbox_sd_ax = plt.axes([0.15, 0.02, 0.7, 0.05])
-    sd_box = TextBox(textbox_sd_ax, 'SD Boxplot', initial="all")
-    
-    def submit_boxplot(text):
-        """
-        Submit callback for the SD Boxplot text box.
-        If 'all' is entered, plot for all measurements, otherwise for specified indices.
-        """
-        text = text.strip().lower()
-        if text == "all":
-            sel = left_results
-            plot_sd_boxplot(sel, n_bands=NUM_BANDS)
-        else:
-            try:
-                indices = [int(x.strip()) for x in text.split(",") if x.strip()]
-                sel = [left_results[i] for i in indices if 0 <= i < num_meas]
-                if len(sel) == 1 and positions is not None and positions.shape[0] > indices[0]:
-                    az = positions[indices[0], 0]
-                    el = positions[indices[0], 1]
-                    plot_sd_boxplot(sel, n_bands=NUM_BANDS, az=az, el=el)
-                else:
-                    plot_sd_boxplot(sel, n_bands=NUM_BANDS)
-            except Exception:
-                print("Invalid input; using all measurements.")
-                plot_sd_boxplot(left_results, n_bands=NUM_BANDS)
-    
-    sd_box.on_submit(submit_boxplot)
-    
-    # Create a text box for error details plotting
-    textbox_err_ax = plt.axes([0.15, 0.08, 0.7, 0.05])
-    err_box = TextBox(textbox_err_ax, 'Error Details', initial="0")
-    
-    def submit_error(text):
-        """
-        Submit callback for the error details text box.
-        Plots the error details for a selected measurement index.
-        """
-        try:
-            idx = int(text.strip())
-            if 0 <= idx < num_meas:
-                if positions is not None and positions.shape[0] > idx:
-                    az = positions[idx, 0]
-                    el = positions[idx, 1]
-                else:
-                    az = el = None
-                plot_error_details(left_results[idx], title_suffix=f"(Left Ear, Measurement {idx})", az=az, el=el)
-            else:
-                print("Index out of range.")
-        except Exception as e:
-            print("Invalid input for error details:", e)
-    
-    err_box.on_submit(submit_error)
-    
-    # Create a text box for filtering error plot
-    textbox_filt_ax = plt.axes([0.15, 0.15, 0.7, 0.05])
-    filt_box = TextBox(textbox_filt_ax, 'Filtering Error', initial="0")
-    
-    def submit_filter(text):
-        """
-        Submit callback for filtering error text box.
-        Plots filtering error for a selected measurement.
-        """
-        try:
-            idx = int(text.strip())
-            if 0 <= idx < num_meas:
-                if positions is not None and positions.shape[0] > idx:
-                    az = positions[idx, 0]
-                    el = positions[idx, 1]
-                else:
-                    az = el = None
-                plot_filtering_error(left_results[idx], title_suffix=f"(Left Ear, Measurement {idx})", az=az, el=el)
-            else:
-                print("Index out of range for filtering error.")
-        except Exception as e:
-            print("Invalid input for filtering error:", e)
-    
-    filt_box.on_submit(submit_filter)
-    
-    # Create a text box for filtering stats plot
-    textbox_filt_stats_ax = plt.axes([0.15, 0.22, 0.7, 0.05])
-    filt_stats_box = TextBox(textbox_filt_stats_ax, 'Filtering Stats', initial="0")
-    
-    def submit_filter_stats(text):
-        """
-        Submit callback for filtering stats text box.
-        Plots filtering statistics for a selected measurement.
-        """
-        try:
-            idx = int(text.strip())
-            if 0 <= idx < num_meas:
-                if positions is not None and positions.shape[0] > idx:
-                    az = positions[idx, 0]
-                    el = positions[idx, 1]
-                else:
-                    az = el = None
-                plot_filtering_stats(left_results[idx], title_suffix=f"(Left Ear, Measurement {idx})", az=az, el=el)
-            else:
-                print("Index out of range for filtering stats.")
-        except Exception as e:
-            print("Invalid input for filtering stats:", e)
-    
-    filt_stats_box.on_submit(submit_filter_stats)
-    
-    # Create a text box for saving the current plot
-    save_ax = plt.axes([0.15, 0.28, 0.7, 0.05])
-    save_box = TextBox(save_ax, 'Save Plot', initial="measurement_plot.png")
-    
-    def submit_save(text):
-        """
-        Submit callback for the save plot text box.
-        Saves the current figure to the specified filename.
-        """
-        filename = text.strip()
-        if filename:
-            try:
-                fig.savefig(filename, dpi=300)
-                print(f"Plot saved as {filename}")
-            except Exception as e:
-                print("Error saving plot:", e)
-    
-    save_box.on_submit(submit_save)
-    
-    # Plot the average filtering error across all measurements
-    plot_average_filtering_error(left_results)
-    
-    print(sofa.__version__)
-    
-    plt.show()
-
-
 if __name__ == "__main__":
     main()
