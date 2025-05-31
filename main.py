@@ -1066,7 +1066,7 @@ def plot_sd_boxplot(measurements, n_bands=24, az=None, el=None):
     title = "Spectral Distortion per ERB Band"
     if az is not None and el is not None:
         title += f" (Az: {az:.1f}°, Elev: {el:.1f}°)"
-    ax.set_ylim(0, 1.05)
+    ax.set_ylim(0, 1.15)
     ax.tick_params(axis='both', which='major', labelsize=25)
     n = len(erb_bounds) - 1
     tick_positions = list(range(1, n+1))
@@ -1214,7 +1214,7 @@ def plot_average_filtering_error(measurements):
     ax.set_xlabel("Frequency (Hz)", fontsize=30)
     ax.set_ylabel("Error (dB)", fontsize=30)
     ax.set_title("Average Filtering Error Across All Measurements", fontsize=35)    
-    ax.set_ylim(-0.10, 0.05)
+    ax.set_ylim(-0.2, 0.15)
     ax.tick_params(axis='both', which='major', labelsize=30)
     ax.legend()
     ax.grid(True, which="both", linestyle="--", alpha=0.7)
